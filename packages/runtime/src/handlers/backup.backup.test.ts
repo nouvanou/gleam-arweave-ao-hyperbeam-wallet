@@ -38,6 +38,7 @@ function device(account: InMemoryCloudAccount, seed: Record<string, unknown> = {
     cloudFile: cloud,
     vault: lifecycle,
     session: keySession,
+    kdfParams: TEST_KDF.kdfParams,
     now: () => (clock.now += 1_000),
   });
   return { storage, keySession, lifecycle, backup, cloud, clock };
@@ -104,6 +105,25 @@ describe("BackupHandler: set up", () => {
     }
     // Quoted as JSON, since a bare "Ada" turns up in random base64 now and then.
     expect(text).not.toContain('"Ada"');
+  });
+
+  it("wraps the backup key at the target cost, not a below-target wallet envelope's", async () => {
+    // The vault fixture's envelopes are at TEST_KDF (64 KiB / 1 pass). A
+    // handler whose target is higher must not copy those parameters into
+    // the backup wrap, the way it must not for a wallet envelope.
+    const target = await unlocked(new InMemoryCloudAccount());
+    const backup = new BackupHandler({
+      storage: target.storage,
+      sessionKeys: new Keyring(),
+      cloudFile: target.cloud,
+      vault: target.lifecycle,
+      session: target.keySession,
+      kdfParams: { memoryKiB: 1_024, iterations: 2, parallelism: 1 },
+      now: () => (target.clock.now += 1_000),
+    });
+    await backup.setUp({ password: PASSWORD });
+    const stored = target.storage.entries.get(BACKUP_KEY) as { wrapped: { memoryKiB: number; iterations: number; parallelism: number } };
+    expect(stored.wrapped).toMatchObject({ memoryKiB: 1_024, iterations: 2, parallelism: 1 });
   });
 
   it("refuses a password that doesn't open the vault, before signing in", async () => {

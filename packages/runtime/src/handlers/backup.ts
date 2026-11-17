@@ -22,12 +22,15 @@ import {
   type BackupData,
   type BackupDevice,
   type BackupStatus,
+  type Argon2idParams,
   type CloudFilePort,
   type SessionKeyStorePort,
   type StoragePort,
   type VaultEnvelopeV2,
 } from "@gleam/core";
 import {
+  DEFAULT_ARGON2ID_PARAMS,
+  envelopeNeedsUpgrade,
   importBackupKey,
   KeyringLockedError,
   mintBackupKey,
@@ -66,6 +69,8 @@ export interface BackupHandlerDeps {
   vault: BackupVault;
   /** A pull writes the wallets under the session lock, as every other wallet write does. */
   session: Pick<KeySession, "withSessionLock" | "isVaultLocked">;
+  /** Argon2id cost for a new backup wrap. Mirrors `WalletLifecycleHandler`'s option. */
+  kdfParams?: Argon2idParams;
   now?: () => number;
 }
 
@@ -99,18 +104,20 @@ export class BackupHandler {
   private readonly cloudFile: CloudFilePort | undefined;
   private readonly vault: BackupVault;
   private readonly session: BackupHandlerDeps["session"];
+  private readonly kdfParams: Argon2idParams;
   private readonly now: () => number;
   /** In memory: a stopped worker pulls on its first tick back. */
   private lastPullAt = Number.NEGATIVE_INFINITY;
   /** One cloud operation at a time: two writes racing would each drop what the other read. */
   private readonly inTurn = createSerializer();
 
-  constructor({ storage, sessionKeys, cloudFile, vault, session, now = Date.now }: BackupHandlerDeps) {
+  constructor({ storage, sessionKeys, cloudFile, vault, session, kdfParams, now = Date.now }: BackupHandlerDeps) {
     this.storage = storage;
     this.sessionKeys = sessionKeys;
     this.cloudFile = cloudFile;
     this.vault = vault;
     this.session = session;
+    this.kdfParams = kdfParams ?? DEFAULT_ARGON2ID_PARAMS;
     this.now = now;
   }
 
@@ -334,15 +341,23 @@ export class BackupHandler {
   /**
    * The salt and cost of a stored wallet's envelope, so the key an unlock
    * derives for the wallets opens the backup key too, with no second
-   * Argon2id run.
+   * Argon2id run. Only an envelope at the target cost is reused: copying
+   * a below-target envelope (one written before the target was raised, or
+   * whose on-unlock upgrade was deferred) would wrap the backup key —
+   * which opens every backed-up keyfile — at that weaker cost, and no
+   * later path re-wraps it. With no envelope at the target, wrap at the
+   * target instead, as `WalletLifecycleHandler.encryptOptionsFor` does.
    */
   private async vaultEncryptOptions(): Promise<EncryptOptions> {
     const wallets = await this.storage.get<unknown>(WALLETS_KEY);
     const envelope = (Array.isArray(wallets) ? wallets : [])
       .filter(isValidWallet)
       .map((wallet) => wallet.encryptedKeyfile)
-      .find((candidate): candidate is VaultEnvelopeV2 => candidate?.version === 2);
-    if (!envelope) return {};
+      .find(
+        (candidate): candidate is VaultEnvelopeV2 =>
+          candidate?.version === 2 && !envelopeNeedsUpgrade(candidate, this.kdfParams),
+      );
+    if (!envelope) return { params: this.kdfParams };
     const { memoryKiB, iterations, parallelism, salt } = envelope;
     return { params: { memoryKiB, iterations, parallelism }, salt };
   }
